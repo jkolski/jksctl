@@ -1,0 +1,16 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Local JKSync/runtime scratch
+queue
+*.log
+
+# Editor/local
+.vscode/
+.idea/
+

@@ -1,0 +1,146 @@
+msgid ""
+msgstr "Language: pl\nContent-Type: text/plain; charset=UTF-8\n"
+
+msgid "cancel"
+msgstr "anuluj"
+
+msgid "cancelled"
+msgstr "Anulowano."
+
+msgid "choice.prompt"
+msgstr "Wybór [{default}]: "
+
+msgid "daemon.closed"
+msgstr "Tunel zamknięty."
+
+msgid "daemon.closing_project"
+msgstr "Zamykam {daemon} dla projektu {project} PID {pid}..."
+
+msgid "daemon.start_interrupted"
+msgstr "Przerwano przed uruchomieniem daemona. Projekt został zapisany, daemon nie został uruchomiony."
+
+msgid "daemon.started_background"
+msgstr "Tunel uruchomiony w tle."
+
+msgid "daemon.still_running_check_log"
+msgstr "Daemon nadal działa. Sprawdź log:"
+
+msgid "doctor.install_macos"
+msgstr "Instalacja na macOS:"
+
+msgid "doctor.missing_tools"
+msgstr "Brakuje wymaganych narzędzi:"
+
+msgid "doctor.unison_fallback"
+msgstr "Tryb Unison przełączy się na rsync."
+
+msgid "existing_project.continue"
+msgstr "zostaw jak jest / pokaż dalsze opcje"
+
+msgid "existing_project.disable"
+msgstr "wyłącz aktywny projekt"
+
+msgid "existing_project.enable"
+msgstr "włącz projekt"
+
+msgid "existing_project.invalid_active"
+msgstr "Wpisz 1/2/3/4 albo continue/reconfigure/disable/cancel."
+
+msgid "existing_project.invalid_inactive"
+msgstr "Wpisz 1/2/3 albo enable/reconfigure/cancel."
+
+msgid "existing_project.reconfigure"
+msgstr "przekonfiguruj projekt"
+
+msgid "existing_project.title"
+msgstr "Ten katalog jest już zarejestrowany w {program}:"
+
+msgid "existing_project.what_next"
+msgstr "Co zrobić?"
+
+msgid "label.mode"
+msgstr "Mode:"
+
+msgid "label.project"
+msgstr "Projekt:"
+
+msgid "label.worktree"
+msgstr "Worktree:"
+
+msgid "language.changed"
+msgstr "Zmieniono język na {language_name} ({language})."
+
+msgid "live.interrupt"
+msgstr "Przerywam live session. Wysyłam SIGINT do {daemon} i czekam na logi shutdown..."
+
+msgid "no"
+msgstr "nie"
+
+msgid "project.already_active_pid"
+msgstr "Ten projekt ma już aktywny tunel: PID {pid}"
+
+msgid "project.close_it"
+msgstr "Zamknąć go?"
+
+msgid "project.not_active_here"
+msgstr "Tunel dla tego katalogu nie jest aktywny."
+
+msgid "project.not_registered_here"
+msgstr "Ten katalog nie jest jeszcze zarejestrowany."
+
+msgid "project_wizard.debounce"
+msgstr "Mikro-debounce po zmianie pliku w sekundach"
+
+msgid "project_wizard.delete_remote"
+msgstr "Czy rsync ma usuwać zdalne pliki usunięte lokalnie?"
+
+msgid "project_wizard.project_name"
+msgstr "Nazwa projektu [{default}]: "
+
+msgid "project_wizard.pull_interval"
+msgstr "Interwał pull/sync w sekundach"
+
+msgid "project_wizard.remote_host"
+msgstr "Serwer SSH, np. user@example.com albo host z ~/.ssh/config: "
+
+msgid "project_wizard.remote_host_required"
+msgstr "Serwer SSH jest wymagany: "
+
+msgid "project_wizard.remote_path"
+msgstr "Zdalna ścieżka absolutna [{default}]: "
+
+msgid "project_wizard.remote_path_absolute"
+msgstr "Podaj absolutną ścieżkę zdalną, zaczynającą się od / [{default}]: "
+
+msgid "project_wizard.title"
+msgstr "Brak projektu w centralnym rejestrze. Kreator konfiguracji."
+
+msgid "run_mode.background"
+msgstr "tło — zwróć prompt od razu i loguj do pliku"
+
+msgid "run_mode.invalid"
+msgstr "Wpisz 1/2, background/bg albo live/l."
+
+msgid "run_mode.live"
+msgstr "live — zostań na pierwszym planie i pokazuj logi"
+
+msgid "run_mode.title"
+msgstr "Jak uruchomić {daemon}?"
+
+msgid "status.missing"
+msgstr "brak"
+
+msgid "sync.initial_failed"
+msgstr "Startowy sync przez {mode} zakończył się błędem. Nie uruchamiam {daemon}."
+
+msgid "sync.initial_hint"
+msgstr "Jeżeli Unison zgłosi konflikt lub nie jest dostępny po stronie serwera, spróbuję rsync pull."
+
+msgid "sync.initial_interrupted"
+msgstr "Przerwano startową synchronizację. Projekt został zapisany, ale daemon nie został uruchomiony."
+
+msgid "sync.initial_start"
+msgstr "Synchronizacja startowa."
+
+msgid "yes"
+msgstr "tak"

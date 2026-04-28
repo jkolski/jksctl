@@ -1,0 +1,1506 @@
+#!/usr/bin/env python3
+"""
+Control CLI for local <-> remote project sync sessions on macOS.
+
+Default invocation names:
+  jksctl (preferred)
+  uspctl (legacy compatibility)
+"""
+
+import atexit
+import argparse
+import contextlib
+import fcntl
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+CURRENT_LANGUAGE = "en"
+TRANSLATIONS = {}
+SUPPORTED_LANGUAGES = {"en": "English", "pl": "Polski"}
+
+PROGRAM_NAME = os.environ.get("JKS_PROGRAM_NAME") or (Path(sys.argv[0] or "jksctl").name or "jksctl")
+CONFIG_NAME = os.environ.get("JKS_CONFIG_NAME") or PROGRAM_NAME
+DEFAULT_DAEMON_NAME = os.environ.get("JKS_DAEMON_NAME") or ("jksd" if PROGRAM_NAME.startswith("jks") else "uspd")
+BRAND_NAME = "JKSync"
+VERSION = "0.2.0"
+EXIT_OK = 0
+EXIT_RUNTIME = 1
+EXIT_USAGE = 2
+EXIT_MISSING_DEPENDENCY = 3
+EXIT_REMOTE_UNAVAILABLE = 4
+EXIT_DAEMON_CONFLICT = 5
+APP_DIR = Path.home() / ".config" / CONFIG_NAME
+LEGACY_APP_DIR = Path.home() / ".config" / "uspctl" if CONFIG_NAME == "jksctl" else None
+STATE_FILE = APP_DIR / "state.json"
+LOG_DIR = APP_DIR / "logs"
+RUN_DIR = APP_DIR / "run"
+LOCK_FILE = RUN_DIR / "state.lock"
+WORKTREE_DIRNAME = "worktree"
+LOCALE_DIR = Path(__file__).resolve().parent / "locale"
+
+REQUIRED_TOOLS = ["git", "ssh", "rsync", "fswatch"]
+OPTIONAL_TOOLS = ["unison"]
+
+ALIASES = {
+    "start": "open", "go": "open", "up": "open",
+    "stop": "close", "halt": "close", "down": "close", "end": "close",
+    "check": "doctor", "diagnose": "doctor",
+    "state": "status", "info": "status",
+    "ls": "list", "projects": "list", "tunnels": "list",
+    "log": "logs", "tail": "logs",
+    "paths": "config",
+
+    "rm": "remove",
+    "delete": "remove",
+    "unregister": "remove",
+}
+
+
+def now():
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def print_json(payload):
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+
+
+def fail(message, code=EXIT_USAGE):
+    print(message, file=sys.stderr)
+    sys.exit(code)
+
+
+@contextlib.contextmanager
+def state_lock():
+    ensure_dirs()
+    with LOCK_FILE.open("w", encoding="utf-8") as lock:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            fail(f"Another {PROGRAM_NAME} process is already changing state: {LOCK_FILE}", EXIT_DAEMON_CONFLICT)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def _po_unquote(value):
+    return json.loads(value)
+
+
+def load_po(path):
+    catalog = {}
+    if not path.exists():
+        return catalog
+
+    current_key = None
+    current_value = None
+    active = None
+
+    def flush():
+        if current_key is not None and current_value is not None:
+            catalog[current_key] = current_value
+
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("msgid "):
+            flush()
+            current_key = _po_unquote(line[6:].strip())
+            current_value = None
+            active = "msgid"
+        elif line.startswith("msgstr "):
+            current_value = _po_unquote(line[7:].strip())
+            active = "msgstr"
+        elif line.startswith('"') and active == "msgid":
+            current_key = (current_key or "") + _po_unquote(line)
+        elif line.startswith('"') and active == "msgstr":
+            current_value = (current_value or "") + _po_unquote(line)
+
+    flush()
+    catalog.pop("", None)  # header
+    return catalog
+
+
+def load_translations():
+    global TRANSLATIONS
+    TRANSLATIONS = {}
+    for lang in SUPPORTED_LANGUAGES:
+        TRANSLATIONS[lang] = load_po(LOCALE_DIR / f"{lang}.po")
+
+
+def set_language(lang):
+    global CURRENT_LANGUAGE
+    CURRENT_LANGUAGE = lang if lang in SUPPORTED_LANGUAGES else "en"
+
+
+def t(key, **kwargs):
+    text = (
+        TRANSLATIONS.get(CURRENT_LANGUAGE, {}).get(key)
+        or TRANSLATIONS.get("en", {}).get(key)
+        or key
+    )
+    return text.format(**kwargs)
+
+
+def migrate_legacy_config_if_needed():
+    if LEGACY_APP_DIR is None or APP_DIR.exists() or not LEGACY_APP_DIR.exists():
+        return
+
+    APP_DIR.parent.mkdir(parents=True, exist_ok=True)
+    LEGACY_APP_DIR.rename(APP_DIR)
+
+    if STATE_FILE.exists():
+        state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        changed = False
+        for project in state.get("projects", {}).values():
+            pid_file = project.get("pid_file")
+            log_file = project.get("log_file")
+            if pid_file and "/.config/uspctl/" in pid_file:
+                project["pid_file"] = pid_file.replace("/.config/uspctl/", f"/.config/{CONFIG_NAME}/")
+                changed = True
+            if log_file and "/.config/uspctl/" in log_file:
+                project["log_file"] = log_file.replace("/.config/uspctl/", f"/.config/{CONFIG_NAME}/")
+                changed = True
+        if changed:
+            STATE_FILE.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def ensure_dirs():
+    migrate_legacy_config_if_needed()
+    APP_DIR.mkdir(parents=True, exist_ok=True)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    RUN_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def empty_state():
+    return {"version": 1, "meta": {"language": "en"}, "projects": {}}
+
+
+def load_state():
+    ensure_dirs()
+    if not STATE_FILE.exists() or STATE_FILE.stat().st_size == 0:
+        return empty_state()
+    try:
+        with STATE_FILE.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    except json.JSONDecodeError:
+        backup = STATE_FILE.with_suffix(f".broken.{int(time.time())}.json")
+        STATE_FILE.rename(backup)
+        print(f"Uszkodzony state.json przeniesiony do: {backup}")
+        return empty_state()
+
+
+def save_state(state):
+    ensure_dirs()
+    tmp = STATE_FILE.with_suffix(".tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2, ensure_ascii=False)
+    tmp.replace(STATE_FILE)
+
+
+def prompt_language(default="en"):
+    print("Choose language / Wybierz język:")
+    print("  1) English")
+    print("  2) Polski")
+
+    options = {"1": "en", "2": "pl", "en": "en", "english": "en", "pl": "pl", "polski": "pl"}
+    default_label = "1" if default == "en" else "2"
+
+    while True:
+        try:
+            value = input(f"Choice / Wybór [{default_label}]: ").strip().lower()
+        except KeyboardInterrupt:
+            print("\nCancelled.")
+            sys.exit(130)
+        if not value:
+            return default
+        if value in options:
+            return options[value]
+        print("Please choose 1/2 (English/Polski).")
+
+
+def ensure_language_initialized(args=None):
+    state_exists = STATE_FILE.exists()
+    if getattr(args, "dry_run", False) and not state_exists:
+        set_language("en")
+        return empty_state()
+
+    state = load_state()
+    meta = state.setdefault("meta", {})
+    lang = meta.get("language")
+
+    if not lang or not state_exists:
+        if sys.stdin.isatty() and not getattr(args, "yes", False):
+            lang = prompt_language(default=lang or "en")
+        else:
+            lang = lang or "en"
+        meta["language"] = lang
+        save_state(state)
+
+    set_language(lang)
+    return state
+
+
+def set_language_in_state(lang):
+    state = load_state()
+    state.setdefault("meta", {})["language"] = lang
+    save_state(state)
+    set_language(lang)
+
+
+def abs_path(path):
+    return str(Path(path).expanduser().resolve())
+
+
+def project_id(path):
+    return hashlib.sha1(abs_path(path).encode("utf-8")).hexdigest()[:12]
+
+
+def current_project_key(state=None, cwd=None):
+    current = Path(cwd or os.getcwd()).expanduser().resolve()
+
+    if state:
+        projects = state.get("projects", {})
+        for candidate in [current, *current.parents]:
+            key = str(candidate)
+            if key in projects:
+                return key
+
+    return str(current)
+
+
+def worktree_path_for(path):
+    return str(Path(path) / WORKTREE_DIRNAME)
+
+
+def project_worktree(project):
+    return abs_path(project.get("worktree_path") or worktree_path_for(project["path"]))
+
+
+def ensure_worktree_dir(path):
+    worktree = Path(worktree_path_for(path))
+    worktree.mkdir(parents=True, exist_ok=True)
+    return str(worktree)
+
+
+def daemon_name():
+    return DEFAULT_DAEMON_NAME
+
+
+def find_daemon():
+    here_dir = Path(__file__).resolve().parent
+    candidates = [daemon_name(), "jksd", "uspd"]
+
+    for candidate in candidates:
+        here = here_dir / candidate
+        if here.exists():
+            return str(here)
+
+    for candidate in candidates:
+        found = shutil.which(candidate)
+        if found:
+            return found
+
+    print(f"Nie znaleziono `{daemon_name()}` obok `{PROGRAM_NAME}` ani w PATH.")
+    print("Umieść oba pliki w tym samym katalogu, np. ~/bin.")
+    sys.exit(EXIT_MISSING_DEPENDENCY)
+
+
+def run(cmd, cwd=None, check=False, capture=False):
+    if capture:
+        return subprocess.run(
+            cmd, cwd=cwd, check=check,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+        )
+    print("$ " + " ".join(cmd))
+    return subprocess.run(cmd, cwd=cwd, check=check)
+
+
+def tool_version(tool):
+    try:
+        if tool == "ssh":
+            cmd = [tool, "-V"]
+        elif tool == "unison":
+            cmd = [tool, "-version"]
+        else:
+            cmd = [tool, "--version"]
+        p = run(cmd, capture=True)
+        first = (p.stdout or "").splitlines()
+        return first[0] if first else "installed"
+    except Exception:
+        return "installed"
+
+
+def doctor(exit_on_missing=True, args=None):
+    ensure_dirs()
+    args = args or argparse.Namespace()
+    missing = []
+    checks = {
+        "program": PROGRAM_NAME,
+        "version": VERSION,
+        "config": str(STATE_FILE),
+        "logs": str(LOG_DIR),
+        "run": str(RUN_DIR),
+        "language": CURRENT_LANGUAGE,
+        "tools": {},
+        "remote": None,
+        "ok": True,
+    }
+
+    for tool in REQUIRED_TOOLS:
+        path = shutil.which(tool)
+        if not path:
+            missing.append(tool)
+            checks["tools"][tool] = {"ok": False, "path": None, "version": None, "required": True}
+        else:
+            checks["tools"][tool] = {"ok": True, "path": path, "version": tool_version(tool), "required": True}
+
+    for tool in OPTIONAL_TOOLS:
+        path = shutil.which(tool)
+        checks["tools"][tool] = {
+            "ok": bool(path),
+            "path": path,
+            "version": tool_version(tool) if path else None,
+            "required": False,
+            "fallback": "rsync" if not path else None,
+        }
+
+    host = getattr(args, "host", None)
+    remote_path = getattr(args, "remote_path", None)
+    if host:
+        checks["remote"] = check_remote(host, remote_path=remote_path)
+        if not checks["remote"].get("ssh_ok"):
+            checks["ok"] = False
+
+    if missing:
+        checks["ok"] = False
+
+    if getattr(args, "json", False):
+        print_json(checks)
+    else:
+        print(f"{PROGRAM_NAME} doctor")
+        print(f"Version: {VERSION}")
+        print(f"Config:  {STATE_FILE}")
+        print(f"Logs:    {LOG_DIR}")
+        print(f"Run:     {RUN_DIR}")
+        print(f"Lock:    {LOCK_FILE}")
+        print(f"Language: {CURRENT_LANGUAGE}")
+        print()
+
+        for tool, info in checks["tools"].items():
+            required = "required" if info["required"] else "optional"
+            if not info["ok"]:
+                marker = "✗" if info["required"] else "⚠"
+                print(f"{marker} {tool}: {t('status.missing')} ({required})")
+                if tool == "unison":
+                    print(f"  {t('doctor.unison_fallback')}")
+            else:
+                print(f"✓ {tool}: {info['path']} ({required})")
+                print(f"  {info['version']}")
+
+        if checks["remote"]:
+            remote = checks["remote"]
+            print()
+            print(f"Remote: {host}")
+            print(f"  ssh: {'ok' if remote.get('ssh_ok') else 'failed'}")
+            if remote_path:
+                print(f"  path {remote_path}: {'ok' if remote.get('path_ok') else 'missing/unavailable'}")
+            print(f"  remote unison: {'ok' if remote.get('unison_ok') else 'missing'}")
+            if not remote.get("unison_ok"):
+                print("  unison fallback: rsync")
+
+        if missing:
+            print(f"\n{t('doctor.missing_tools')}")
+            for tool in missing:
+                print(f"  - {tool}")
+            print(f"\n{t('doctor.install_macos')}")
+            print("  brew install fswatch rsync git")
+            print("  brew install unison   # optional, for mode=unison")
+
+    if missing and exit_on_missing:
+        sys.exit(EXIT_MISSING_DEPENDENCY)
+
+    return not missing and checks["ok"]
+
+
+def check_remote(host, remote_path=None):
+    script_parts = ["echo JKS_SSH_OK"]
+    if remote_path:
+        quoted = remote_path.replace("'", "'\\''")
+        script_parts.append(f"test -d '{quoted}' && echo JKS_PATH_OK || echo JKS_PATH_MISSING")
+    script_parts.append("command -v unison >/dev/null 2>&1 && echo JKS_UNISON_OK || echo JKS_UNISON_MISSING")
+    script = "; ".join(script_parts)
+    result = subprocess.run(
+        ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", host, script],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    output = result.stdout or ""
+    return {
+        "host": host,
+        "remote_path": remote_path,
+        "ssh_ok": result.returncode == 0 and "JKS_SSH_OK" in output,
+        "path_ok": None if not remote_path else "JKS_PATH_OK" in output,
+        "unison_ok": "JKS_UNISON_OK" in output,
+        "returncode": result.returncode,
+        "output": output.strip().splitlines()[-10:],
+    }
+
+
+def ensure_git(path):
+    git_dir = Path(path) / ".git"
+    if not git_dir.exists():
+        run(["git", "init"], cwd=path, check=True)
+
+    gitignore = Path(path) / ".gitignore"
+    required_entries = [".DS_Store", "worktree/.git/", ".usp-cache/"]
+
+    if gitignore.exists():
+        existing_lines = gitignore.read_text(encoding="utf-8").splitlines()
+    else:
+        existing_lines = []
+
+    changed = False
+    for entry in required_entries:
+        if entry not in existing_lines:
+            existing_lines.append(entry)
+            changed = True
+
+    if changed or not gitignore.exists():
+        content = "\n".join(existing_lines).rstrip() + "\n\n"
+        gitignore.write_text(content, encoding="utf-8")
+
+
+def ensure_git_with_tracking(path):
+    git_existed = (Path(path) / ".git").exists()
+    gitignore_existed = (Path(path) / ".gitignore").exists()
+    ensure_git(path)
+    created_git = not git_existed and (Path(path) / ".git").exists()
+    created_gitignore = not gitignore_existed and (Path(path) / ".gitignore").exists()
+    return created_git, created_gitignore
+
+
+def cleanup_aborted_init(path, created_git=False, created_gitignore=False):
+    print("\nPrzerwano konfigurację. Sprzątam niedokończony init.")
+    state = load_state()
+
+    if path in state.get("projects", {}):
+        print("Projekt jest już zapisany w state.json, nie usuwam plików projektu.")
+        return
+
+    git_dir = Path(path) / ".git"
+    gitignore = Path(path) / ".gitignore"
+
+    if created_git and git_dir.exists():
+        shutil.rmtree(git_dir)
+        print("Usunięto tymczasowe .git")
+
+    if created_gitignore and gitignore.exists():
+        gitignore.unlink()
+        print("Usunięto tymczasowe .gitignore")
+
+    print("Zakończono bez zapisu projektu.")
+
+
+def git_commit_env():
+    env = os.environ.copy()
+    env.setdefault("GIT_AUTHOR_NAME", "JKSync")
+    env.setdefault("GIT_AUTHOR_EMAIL", "jksync@localhost")
+    env.setdefault("GIT_COMMITTER_NAME", env["GIT_AUTHOR_NAME"])
+    env.setdefault("GIT_COMMITTER_EMAIL", env["GIT_AUTHOR_EMAIL"])
+    return env
+
+
+def git_commit(path, message):
+    run(["git", "add", "-A"], cwd=path)
+    diff = subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=path)
+    if diff.returncode == 0:
+        print("Git: brak zmian do commita.")
+        return False
+    print("$ git commit -m " + json.dumps(message))
+    result = subprocess.run(["git", "commit", "-m", message], cwd=path, env=git_commit_env())
+    return result.returncode == 0
+
+
+def prompt_bool(question, default=True):
+    suffix = "[T/n]" if default else "[t/N]"
+    value = input(f"{question} {suffix}: ").strip().lower()
+    if not value:
+        return default
+    return value in ["t", "tak", "y", "yes"]
+
+
+def prompt_int(question, default):
+    value = input(f"{question} [{default}]: ").strip()
+    if not value:
+        return default
+    return int(value)
+
+
+def prompt_float(question, default):
+    value = input(f"{question} [{default}]: ").strip()
+    if not value:
+        return default
+    return float(value)
+
+
+def prompt_run_mode(default="background"):
+    options = {
+        "1": "background",
+        "2": "live",
+        "b": "background",
+        "bg": "background",
+        "background": "background",
+        "l": "live",
+        "live": "live",
+    }
+    default_label = "1" if default == "background" else "2"
+
+    print(f"\n{t('run_mode.title', daemon=daemon_name())}")
+    print(f"  1) {t('run_mode.background')}")
+    print(f"  2) {t('run_mode.live')}")
+
+    while True:
+        value = input(f"{t('choice.prompt', default=default_label)}").strip().lower()
+        if not value:
+            return default
+        if value in options:
+            return options[value]
+        print(t('run_mode.invalid'))
+
+
+def prompt_existing_project_action(project):
+    active = project.get("active") and pid_alive(project.get("pid"))
+    options = {
+        "1": "enable",
+        "2": "reconfigure",
+        "e": "enable",
+        "enable": "enable",
+        "w": "enable",
+        "wlacz": "enable",
+        "r": "reconfigure",
+        "reconfigure": "reconfigure",
+        "k": "cancel",
+        "cancel": "cancel",
+    }
+
+    print(f"\n{t('existing_project.title', program=PROGRAM_NAME)}")
+    print(f"  name:     {project['name']}")
+    print(f"  remote:   {project['remote_host']}:{project['remote_path']}")
+    print(f"  worktree: {project_worktree(project)}")
+    print(f"  active:   {t('yes') if active else t('no')}")
+    print(t('existing_project.what_next'))
+
+    if active:
+        print(f"  1) {t('existing_project.continue')}")
+        options["1"] = "continue"
+        options["continue"] = "continue"
+        options["c"] = "continue"
+    else:
+        print(f"  1) {t('existing_project.enable')}")
+
+    print(f"  2) {t('existing_project.reconfigure')}")
+    next_option = 3
+    if active:
+        print(f"  3) {t('existing_project.disable')}")
+        options.update({"3": "disable", "d": "disable", "disable": "disable"})
+        next_option = 4
+    print(f"  {next_option}) {t('cancel')}")
+    options.update({str(next_option): "cancel"})
+
+    while True:
+        value = input(t('choice.prompt', default='1')).strip().lower()
+        if not value:
+            return "continue" if active else "enable"
+        if value in options:
+            return options[value]
+        if active:
+            print(t('existing_project.invalid_active'))
+        else:
+            print(t('existing_project.invalid_inactive'))
+
+
+def create_project_config(path, forced_mode=None, args=None):
+    print(f"\n{t('project_wizard.title')}\n")
+
+    default_name = Path(path).name or "project"
+    default_remote_path = "/var/www/cms"
+    non_interactive = bool(getattr(args, "yes", False)) or not sys.stdin.isatty()
+
+    name = getattr(args, "name", None) or default_name
+    remote_host = getattr(args, "host", None)
+    remote_path = getattr(args, "remote_path", None)
+
+    if not remote_host and not non_interactive:
+        name = input(f"{t('project_wizard.project_name', default=default_name)}").strip() or default_name
+        remote_host = input(f"{t('project_wizard.remote_host')}").strip()
+        remote_path = input(f"{t('project_wizard.remote_path', default=default_remote_path)}").strip() or default_remote_path
+
+        while not remote_host:
+            remote_host = input(f"{t('project_wizard.remote_host_required')}").strip()
+
+        while not remote_path.startswith("/"):
+            remote_path = input(f"{t('project_wizard.remote_path_absolute', default=default_remote_path)}").strip() or default_remote_path
+    else:
+        if not remote_host:
+            print("Missing required --host for non-interactive project creation.")
+            sys.exit(2)
+        remote_path = remote_path or default_remote_path
+        if not remote_path.startswith("/"):
+            print("--remote-path must be an absolute path starting with /.")
+            sys.exit(2)
+
+    if getattr(args, "pull_interval", None) is not None:
+        pull_interval = args.pull_interval
+    elif non_interactive:
+        pull_interval = 60
+    else:
+        pull_interval = prompt_int(t('project_wizard.pull_interval'), 60)
+
+    if getattr(args, "debounce", None) is not None:
+        debounce = args.debounce
+    elif non_interactive:
+        debounce = 0.3
+    else:
+        debounce = prompt_float(t('project_wizard.debounce'), 0.3)
+
+    if getattr(args, "delete_remote", None) is not None:
+        delete_remote = args.delete_remote
+    elif non_interactive:
+        delete_remote = False
+    else:
+        delete_remote = prompt_bool(t('project_wizard.delete_remote'), False)
+
+    mode = forced_mode or "unison"
+    pid_file = str(RUN_DIR / f"{project_id(path)}.pid")
+    log_file = str(LOG_DIR / f"{name}.log")
+    worktree_path = ensure_worktree_dir(path)
+
+    return {
+        "id": project_id(path),
+        "name": name,
+        "path": path,
+        "worktree_path": worktree_path,
+        "remote_host": remote_host,
+        "remote_path": remote_path,
+        "mode": mode,
+        "pull_interval": pull_interval,
+        "debounce": debounce,
+        "delete_remote": delete_remote,
+        "active": False,
+        "pid": None,
+        "pid_file": pid_file,
+        "log_file": log_file,
+        "created_at": now(),
+        "updated_at": now(),
+        "started_at": None,
+        "stopped_at": None,
+        "last_unison_at": None,
+        "last_rsync_pull_at": None,
+        "last_rsync_push_at": None,
+        "last_commit_at": None,
+        "last_error": None,
+    }
+
+
+def unison_remote(project):
+    return f"ssh://{project['remote_host']}/{project['remote_path']}"
+
+
+def run_unison(project, batch=False):
+    cmd = [
+        "unison",
+        project_worktree(project),
+        unison_remote(project),
+        "-ignore", "Name .git",
+        "-ignore", "Name .DS_Store",
+        "-ignore", "Name .usp-cache",
+        "-terse",
+    ]
+    if batch:
+        cmd += ["-batch", "-auto"]
+    return run(cmd)
+
+
+def rsync_pull(project):
+    source = f"{project['remote_host']}:{project['remote_path'].rstrip('/')}/"
+    dest = project_worktree(project).rstrip("/") + "/"
+    cmd = [
+        "rsync", "-az",
+        "--omit-dir-times",
+        "--exclude", ".git",
+        "--exclude", ".DS_Store",
+        "--exclude", ".usp-cache",
+        source, dest,
+    ]
+    return run(cmd)
+
+
+def rsync_push(project):
+    source = project_worktree(project).rstrip("/") + "/"
+    dest = f"{project['remote_host']}:{project['remote_path'].rstrip('/')}/"
+    cmd = [
+        "rsync", "-az",
+        "--omit-dir-times",
+        "--exclude", ".git",
+        "--exclude", ".DS_Store",
+        "--exclude", ".usp-cache",
+    ]
+    if project.get("delete_remote"):
+        cmd.append("--delete")
+    cmd += [source, dest]
+    return run(cmd)
+
+
+def initial_sync_with_fallback(project):
+    mode = project.get("mode", "unison")
+
+    if mode == "rsync":
+        print(f"\n[{PROGRAM_NAME}] Startowy sync: rsync pull")
+        result = rsync_pull(project)
+        return result.returncode, "rsync"
+
+    if not shutil.which("unison"):
+        print(f"\n[{PROGRAM_NAME}] Unison nie jest lokalnie dostępny → fallback do rsync pull")
+        result = rsync_pull(project)
+        return result.returncode, "rsync"
+
+    print(f"\n[{PROGRAM_NAME}] Startowy sync: Unison")
+    result = run_unison(project, batch=False)
+    if result.returncode == 0:
+        return 0, "unison"
+
+    print(f"\n[{PROGRAM_NAME}] Unison failed → fallback do rsync pull\n")
+    result = rsync_pull(project)
+    return result.returncode, "rsync"
+
+
+def pid_alive(pid):
+    if not pid:
+        return False
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:
+        return False
+
+
+def reconcile_state(state):
+    changed = False
+    for project in state.get("projects", {}).values():
+        if project.get("active") and not pid_alive(project.get("pid")):
+            project["active"] = False
+            project["pid"] = None
+            project["stopped_at"] = now()
+            project["last_error"] = f"PID not alive during {PROGRAM_NAME} state reconciliation"
+            changed = True
+    if changed:
+        save_state(state)
+    return state
+
+
+def print_active_tunnels(state):
+    active = [
+        p for p in state.get("projects", {}).values()
+        if p.get("active") and pid_alive(p.get("pid"))
+    ]
+
+    print(f"Aktywne tunele: {len(active)}")
+    for p in active:
+        print(f"  - {p['name']} | mode={p.get('mode', 'unison')} | PID {p.get('pid')} | {p['path']}")
+
+
+def resolve_project_key(state, path=None, name=None, default_to_cwd=True):
+    projects = state.get("projects", {})
+
+    if path:
+        key = abs_path(path)
+        return key if key in projects else None
+
+    if name:
+        matches = [key for key, project in projects.items() if project.get("name") == name]
+        if not matches:
+            return None
+        if len(matches) > 1:
+            print(f"Znaleziono wiele projektów o nazwie '{name}':")
+            for key in matches:
+                project = projects[key]
+                print(f"- path={project['path']} | worktree={project_worktree(project)}")
+            print("Użyj --path, żeby wskazać konkretny projekt.")
+            sys.exit(2)
+        return matches[0]
+
+    if default_to_cwd:
+        return current_project_key(state=state)
+
+    return None
+
+
+def daemon_env():
+    env = os.environ.copy()
+    env["JKS_CONTROL_NAME"] = PROGRAM_NAME
+    env["JKS_CONFIG_NAME"] = CONFIG_NAME
+    return env
+
+
+def start_background_daemon(project, path, uspd):
+    log_file = Path(project["log_file"])
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [sys.executable, uspd, "--project", path]
+
+    with log_file.open("a", encoding="utf-8") as log:
+        process = subprocess.Popen(cmd, stdout=log, stderr=log, start_new_session=True, env=daemon_env())
+
+    project["active"] = True
+    project["pid"] = process.pid
+    project["started_at"] = now()
+    project["updated_at"] = now()
+    project["last_error"] = None
+    Path(project["pid_file"]).write_text(str(process.pid), encoding="utf-8")
+
+    return process
+
+
+def validate_open_args(args):
+    if getattr(args, "live", False) and getattr(args, "background", False):
+        fail("Choose either --live or --background, not both.", EXIT_USAGE)
+    if getattr(args, "pull_interval", None) is not None and args.pull_interval < 1:
+        fail("--pull-interval must be >= 1.", EXIT_USAGE)
+    if getattr(args, "debounce", None) is not None and args.debounce < 0:
+        fail("--debounce must be >= 0.", EXIT_USAGE)
+    if getattr(args, "remote_path", None) and not args.remote_path.startswith("/"):
+        fail("--remote-path must be an absolute path starting with /.", EXIT_USAGE)
+
+
+def project_summary(project):
+    active = project.get("active") and pid_alive(project.get("pid"))
+    payload = dict(project)
+    payload["active"] = bool(active)
+    payload["pid_alive"] = bool(active)
+    payload["worktree_path"] = project_worktree(project)
+    return payload
+
+
+def planned_project_from_args(path, args):
+    default_name = Path(path).name or "project"
+    return {
+        "id": project_id(path),
+        "name": getattr(args, "name", None) or default_name,
+        "path": path,
+        "worktree_path": worktree_path_for(path),
+        "remote_host": getattr(args, "host", None),
+        "remote_path": getattr(args, "remote_path", None) or "/var/www/cms",
+        "mode": getattr(args, "mode", None) or "unison",
+        "pull_interval": getattr(args, "pull_interval", None) or 60,
+        "debounce": getattr(args, "debounce", None) if getattr(args, "debounce", None) is not None else 0.3,
+        "delete_remote": bool(getattr(args, "delete_remote", False)),
+        "config": str(STATE_FILE),
+        "logs": str(LOG_DIR),
+        "run": str(RUN_DIR),
+    }
+
+
+def dry_run_open(args):
+    validate_open_args(args)
+    state = reconcile_state(load_state())
+    path = current_project_key(state=state)
+    existing = state.get("projects", {}).get(path)
+    plan = {
+        "program": PROGRAM_NAME,
+        "version": VERSION,
+        "command": args.command,
+        "session_root": path,
+        "exists": bool(existing),
+        "action": "reuse" if existing else "create",
+        "project": project_summary(existing) if existing else planned_project_from_args(path, args),
+        "will_sync": args.command == "open",
+        "will_start_daemon": args.command == "open",
+    }
+    if getattr(args, "json", False):
+        print_json(plan)
+    else:
+        print(f"{PROGRAM_NAME} dry-run")
+        print(f"Session root: {plan['session_root']}")
+        print(f"Action: {plan['action']}")
+        p = plan["project"]
+        print(f"Project: {p.get('name')}")
+        print(f"Worktree: {p.get('worktree_path')}")
+        print(f"Remote: {p.get('remote_host')}:{p.get('remote_path')}")
+        print(f"Mode: {p.get('mode')}")
+        print(f"Config: {STATE_FILE}")
+        print(f"Will sync: {plan['will_sync']}")
+        print(f"Will start daemon: {plan['will_start_daemon']}")
+
+
+def preflight_layout(path, project, non_interactive=False):
+    session_root = Path(path)
+    worktree = Path(project_worktree(project))
+    allowed = {".git", ".gitignore", WORKTREE_DIRNAME}
+    warnings = []
+    if worktree.exists() and any(worktree.iterdir()):
+        warnings.append(f"Worktree is not empty before initial sync: {worktree}")
+    root_payload = [p.name for p in session_root.iterdir() if p.name not in allowed and not p.name.startswith(".jks")]
+    if root_payload:
+        warnings.append("Session root contains files outside worktree/: " + ", ".join(sorted(root_payload)[:20]))
+    for warning in warnings:
+        print(f"⚠ {warning}")
+    return warnings
+
+
+def start_live_daemon(project, path, uspd):
+    log_file = Path(project["log_file"])
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [sys.executable, uspd, "--project", path]
+
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        env=daemon_env(),
+    )
+
+    project["active"] = True
+    project["pid"] = process.pid
+    project["started_at"] = now()
+    project["updated_at"] = now()
+    project["last_error"] = None
+    Path(project["pid_file"]).write_text(str(process.pid), encoding="utf-8")
+
+    print(f"\nTryb live. Ctrl+C zatrzyma {daemon_name()} graceful shutdownem.\n")
+
+    with log_file.open("a", encoding="utf-8") as log:
+        try:
+            if process.stdout:
+                for line in process.stdout:
+                    print(line, end="")
+                    log.write(line)
+                    log.flush()
+            return process.wait()
+        except KeyboardInterrupt:
+            print(f"\n{t('live.interrupt', daemon=daemon_name())}\n")
+            try:
+                process.send_signal(2)
+            except Exception:
+                pass
+            return process.wait()
+
+
+def open_project(args):
+    validate_open_args(args)
+    if getattr(args, "dry_run", False):
+        dry_run_open(args)
+        return
+    doctor(exit_on_missing=True)
+
+    lock_context = state_lock()
+    lock_context.__enter__()
+    atexit.register(lambda: lock_context.__exit__(None, None, None))
+    state = reconcile_state(load_state())
+    path = current_project_key(state=state)
+    Path(path).mkdir(parents=True, exist_ok=True)
+    worktree_path = ensure_worktree_dir(path)
+
+    projects = state.setdefault("projects", {})
+
+    print_active_tunnels(state)
+
+    created_git = False
+    created_gitignore = False
+
+    try:
+        if path not in projects:
+            created_git, created_gitignore = ensure_git_with_tracking(path)
+            projects[path] = create_project_config(path, forced_mode=args.mode, args=args)
+            save_state(state)
+        else:
+            project = projects[path]
+            project["worktree_path"] = project.get("worktree_path") or worktree_path
+            ensure_git(path)
+
+            action = "continue"
+            if not args.yes:
+                action = prompt_existing_project_action(project)
+
+            if action == "cancel":
+                print(t('cancelled'))
+                return
+
+            if action == "disable":
+                close_args = argparse.Namespace(wait=True, timeout=30)
+                close_project(close_args)
+                return
+
+            if action in ["continue", "enable"] and project.get("active") and pid_alive(project.get("pid")):
+                print(f"\n{t('project.already_active_pid', pid=project['pid'])}")
+                return
+
+            if action == "reconfigure":
+                new_project = create_project_config(path, forced_mode=args.mode, args=args)
+                new_project["created_at"] = project.get("created_at", new_project["created_at"])
+                projects[path] = new_project
+            else:
+                if args.mode:
+                    project["mode"] = args.mode
+                project["updated_at"] = now()
+            save_state(state)
+    except KeyboardInterrupt:
+        cleanup_aborted_init(path, created_git=created_git, created_gitignore=created_gitignore)
+        sys.exit(130)
+
+    project = projects[path]
+
+    if project.get("active") and pid_alive(project.get("pid")):
+        print(f"\n{t('project.already_active_pid', pid=project['pid'])}")
+        if prompt_bool(t('project.close_it'), False):
+            close_project(args)
+        return
+
+    if args.command == "init":
+        save_state(state)
+        print(f"Initialized {PROGRAM_NAME} project without starting {daemon_name()}.")
+        print(f"Project: {project['name']}")
+        print(f"Worktree: {project_worktree(project)}")
+        return
+
+    preflight_layout(path, project, non_interactive=getattr(args, "yes", False))
+
+    print(f"\n{t('sync.initial_start')}")
+    print(f"{t('sync.initial_hint')}\n")
+
+    try:
+        code, used_mode = initial_sync_with_fallback(project)
+    except KeyboardInterrupt:
+        print(f"\n{t('sync.initial_interrupted')}")
+        sys.exit(130)
+
+    project["mode"] = used_mode
+    project["updated_at"] = now()
+
+    if code != 0:
+        project["last_error"] = f"initial {used_mode} sync failed with code {code}"
+        save_state(state)
+        print(f"\n{t('sync.initial_failed', mode=used_mode, daemon=daemon_name())}")
+        sys.exit(code)
+
+    if used_mode == "unison":
+        project["last_unison_at"] = now()
+    else:
+        project["last_rsync_pull_at"] = now()
+
+    if git_commit(path, f"{PROGRAM_NAME} open {now()}"):
+        project["last_commit_at"] = now()
+
+    save_state(state)
+
+    try:
+        if getattr(args, "live", False):
+            run_mode = "live"
+        elif getattr(args, "background", False) or args.yes:
+            run_mode = "background"
+        else:
+            run_mode = prompt_run_mode(default="background")
+    except KeyboardInterrupt:
+        print(f"\n{t('daemon.start_interrupted')}")
+        sys.exit(130)
+
+    daemon_path = find_daemon()
+
+    if run_mode == "background":
+        process = start_background_daemon(project, path, daemon_path)
+        save_state(state)
+
+        print(f"\n{t('daemon.started_background')}")
+        print(f"{t('label.project')} {project['name']}")
+        print(f"{t('label.mode')} {project.get('mode', 'unison')}")
+        print(f"{t('label.worktree')} {project_worktree(project)}")
+        print(f"PID:     {process.pid}")
+        print(f"Log:     {project['log_file']}")
+        return
+
+    save_state(state)
+    exit_code = start_live_daemon(project, path, daemon_path)
+    state = reconcile_state(load_state())
+    save_state(state)
+    if exit_code not in [0, None]:
+        sys.exit(exit_code)
+
+
+def close_project(args):
+    state = reconcile_state(load_state())
+    path = current_project_key(state=state)
+    project = state.get("projects", {}).get(path)
+
+    if not project:
+        print(t('project.not_registered_here'))
+        return
+
+    pid = project.get("pid")
+    if not project.get("active") or not pid_alive(pid):
+        print(t('project.not_active_here'))
+        project["active"] = False
+        project["pid"] = None
+        save_state(state)
+        return
+
+    print(t('daemon.closing_project', daemon=daemon_name(), project=project['name'], pid=pid))
+    os.kill(int(pid), 15)
+
+    wait = getattr(args, "wait", True)
+    timeout = getattr(args, "timeout", 30)
+
+    if wait:
+        for _ in range(timeout):
+            time.sleep(1)
+            state = reconcile_state(load_state())
+            project = state.get("projects", {}).get(path)
+            if not project or not project.get("active"):
+                print(t('daemon.closed'))
+                return
+
+        print(t('daemon.still_running_check_log'))
+        print(project.get("log_file"))
+
+
+def remove_project(args):
+    state = reconcile_state(load_state())
+    projects = state.setdefault("projects", {})
+    path = resolve_project_key(state, path=getattr(args, "path", None), name=getattr(args, "name", None))
+    project = projects.get(path)
+
+    if not project:
+        if getattr(args, "path", None):
+            print(f"Projekt o path {abs_path(args.path)} nie jest zarejestrowany.")
+        elif getattr(args, "name", None):
+            print(f"Projekt o nazwie {args.name} nie jest zarejestrowany.")
+        else:
+            print("Ten katalog nie jest zarejestrowany.")
+        return
+
+    session_root = Path(path)
+    worktree = Path(project_worktree(project))
+    hard_remove = getattr(args, "hard", False)
+
+    pid = project.get("pid")
+    if project.get("active") and pid_alive(pid):
+        if getattr(args, "force", False) or prompt_bool(f"Projekt {project['name']} ma aktywny tunel PID {pid}. Zamknąć?", True):
+            close_args = argparse.Namespace(wait=True, timeout=getattr(args, "timeout", 30))
+            close_project(close_args)
+            state = reconcile_state(load_state())
+            projects = state.setdefault("projects", {})
+            project = projects.get(path)
+        else:
+            print("Nie usuwam aktywnego projektu.")
+            return
+
+    if hard_remove:
+        resolved_root = session_root.resolve()
+        if resolved_root in [Path("/"), Path.home().resolve()] or len(resolved_root.parts) < 4:
+            print("Odmowa hard remove dla niebezpiecznej ścieżki session root.")
+            return
+        if not (session_root / ".git").exists() or Path(project_worktree(project)).resolve().parent != resolved_root:
+            print("Odmowa hard remove: katalog nie wygląda jak session root JKSync z lokalnym worktree/.")
+            return
+        if not sys.stdin.isatty() and not getattr(args, "yes", False):
+            print("Odmowa hard remove bez --yes w trybie non-interactive.")
+            return
+        if not getattr(args, "yes", False):
+            if not prompt_bool(f"Twardo usunąć projekt {project['name']} razem z katalogiem {session_root}?", False):
+                print("Anulowano.")
+                return
+    else:
+        if not getattr(args, "yes", False):
+            if not prompt_bool(f"Usunąć projekt {project['name']} z rejestru?", False):
+                print("Anulowano.")
+                return
+
+    pid_file = project.get("pid_file")
+    if pid_file:
+        try:
+            Path(pid_file).unlink(missing_ok=True)
+            print(f"Usunięto PID file: {pid_file}")
+        except Exception as exc:
+            print(f"Nie udało się usunąć PID file: {exc}")
+
+    log_file = project.get("log_file")
+    if log_file and (getattr(args, "remove_log", False) or hard_remove):
+        try:
+            Path(log_file).unlink(missing_ok=True)
+            print(f"Usunięto log: {log_file}")
+        except Exception as exc:
+            print(f"Nie udało się usunąć logu: {exc}")
+
+    if getattr(args, "remove_git", False) and not hard_remove:
+        git_dir = session_root / ".git"
+        gitignore = session_root / ".gitignore"
+
+        if git_dir.exists():
+            if getattr(args, "yes", False) or prompt_bool("Usunąć lokalne .git?", False):
+                shutil.rmtree(git_dir)
+                print("Usunięto .git")
+
+        if gitignore.exists():
+            if getattr(args, "yes", False) or prompt_bool("Usunąć lokalne .gitignore?", False):
+                gitignore.unlink()
+                print("Usunięto .gitignore")
+
+    projects.pop(path, None)
+    save_state(state)
+
+    if hard_remove:
+        if worktree.exists() and worktree.parent != session_root:
+            try:
+                shutil.rmtree(worktree)
+                print(f"Usunięto worktree: {worktree}")
+            except Exception as exc:
+                print(f"Nie udało się usunąć worktree: {exc}")
+
+        try:
+            shutil.rmtree(session_root)
+            print(f"Usunięto katalog projektu: {session_root}")
+        except Exception as exc:
+            print(f"Projekt usunięto z rejestru, ale nie udało się usunąć katalogu: {exc}")
+            return
+
+        print(f"Twardo usunięto projekt: {path}")
+        return
+
+    print(f"Usunięto projekt z rejestru: {path}")
+
+def status_project(args):
+    state = reconcile_state(load_state())
+    path = current_project_key(state=state)
+    project = state.get("projects", {}).get(path)
+    if not project:
+        if getattr(args, "json", False):
+            print_json({"ok": False, "registered": False, "path": path})
+        else:
+            print("Ten katalog nie jest jeszcze zarejestrowany.")
+        return
+    payload = project_summary(project)
+    if getattr(args, "json", False):
+        print_json(payload)
+    else:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+
+
+def list_projects(args):
+    state = reconcile_state(load_state())
+    projects = [project_summary(p) for p in state.get("projects", {}).values()]
+    if getattr(args, "json", False):
+        print_json({"projects": projects, "count": len(projects)})
+        return
+    print_active_tunnels(state)
+    print("\nProjekty:")
+    for project in projects:
+        marker = "●" if project.get("active") else "○"
+        print(
+            f"{marker} {project['name']} | "
+            f"mode={project.get('mode', 'unison')} | "
+            f"active={bool(project.get('active'))} | "
+            f"pid={project.get('pid')} | "
+            f"path={project['path']} | "
+            f"worktree={project_worktree(project)} | "
+            f"remote={project['remote_host']}:{project['remote_path']}"
+        )
+
+
+def version(args):
+    payload = {"program": PROGRAM_NAME, "brand": BRAND_NAME, "version": VERSION, "daemon": daemon_name()}
+    if getattr(args, "json", False):
+        print_json(payload)
+    else:
+        print(f"{BRAND_NAME} {VERSION}")
+        print(f"program={PROGRAM_NAME}")
+        print(f"daemon={daemon_name()}")
+
+
+def config(args):
+    ensure_dirs()
+
+    if getattr(args, "language", None):
+        set_language_in_state(args.language)
+        print(t("language.changed", language=args.language, language_name=SUPPORTED_LANGUAGES[args.language]))
+
+    state = load_state()
+    current_language = state.setdefault("meta", {}).get("language", "en")
+    set_language(current_language)
+
+    print(f"APP_DIR={APP_DIR}")
+    print(f"STATE_FILE={STATE_FILE}")
+    print(f"LOG_DIR={LOG_DIR}")
+    print(f"RUN_DIR={RUN_DIR}")
+    print(f"LANGUAGE={current_language}")
+
+
+def logs(args):
+    state = reconcile_state(load_state())
+    path = current_project_key(state=state)
+    project = state.get("projects", {}).get(path)
+
+    if not project:
+        print("Ten katalog nie jest jeszcze zarejestrowany.")
+        return
+
+    log_file = project.get("log_file")
+    if not log_file or not Path(log_file).exists():
+        print("Brak logu.")
+        return
+
+    subprocess.run(["tail", "-n", str(args.lines), log_file])
+
+
+def add_open_parser(sub, name):
+    p = sub.add_parser(name)
+    p.add_argument("-y", "--yes", action="store_true", help="Nie pytaj o tryb uruchomienia; domyślnie start w tle")
+    p.add_argument("--dry-run", action="store_true", help="Show planned configuration without syncing or starting daemon")
+    p.add_argument("--json", action="store_true", help="Emit machine-readable JSON where supported")
+    p.add_argument("--host", help="SSH host, e.g. user@example.com or a host from ~/.ssh/config")
+    p.add_argument("--remote-path", help="Remote absolute path to sync, e.g. /var/www/cms")
+    p.add_argument("--name", help="Project name stored in state and used for logs")
+    p.add_argument("--mode", choices=["unison", "rsync"], help="Wymuś tryb synchronizacji")
+    p.add_argument("--pull-interval", type=int, help="Pull/sync interval in seconds")
+    p.add_argument("--debounce", type=float, help="Micro-debounce after file change in seconds")
+    p.add_argument("--delete-remote", dest="delete_remote", action="store_true", default=None, help="Allow rsync to delete remote files deleted locally")
+    p.add_argument("--no-delete-remote", dest="delete_remote", action="store_false", help="Do not delete remote files deleted locally")
+    p.add_argument("--background", action="store_true", help=f"Uruchom {daemon_name()} w tle")
+    p.add_argument("--live", action="store_true", help=f"Uruchom {daemon_name()} na pierwszym planie i pokazuj logi")
+    return p
+
+
+def add_close_parser(sub, name):
+    p = sub.add_parser(name)
+    p.add_argument("--no-wait", dest="wait", action="store_false", default=True)
+    p.add_argument("--timeout", type=int, default=30)
+    return p
+
+
+
+def add_remove_parser(sub, name):
+    p = sub.add_parser(name)
+    p.add_argument("-y", "--yes", action="store_true", help="Nie pytaj o potwierdzenie usunięcia z rejestru")
+    p.add_argument("-f", "--force", action="store_true", help="Zamknij aktywny daemon bez pytania")
+    p.add_argument("--path", help="Usuń projekt wskazany absolutną lub względną ścieżką session root")
+    p.add_argument("--name", help="Usuń projekt po nazwie; jeśli nazwa nie jest unikalna, użyj --path")
+    p.add_argument("--timeout", type=int, default=30, help="Ile sekund czekać na zamknięcie daemona")
+    p.add_argument("--hard", action="store_true", help="Twardo usuń projekt: wykreśl z rejestru i skasuj katalog projektu")
+    p.add_argument("--remove-git", action="store_true", help="Opcjonalnie usuń .git i .gitignore z session root")
+    p.add_argument("--remove-log", action="store_true", help="Opcjonalnie usuń log projektu")
+    return p
+
+def add_logs_parser(sub, name):
+    p = sub.add_parser(name)
+    p.add_argument("-n", "--lines", type=int, default=80)
+    return p
+
+
+def add_config_parser(sub, name):
+    p = sub.add_parser(name)
+    p.add_argument("--language", choices=sorted(SUPPORTED_LANGUAGES.keys()), help="Set UI language")
+    return p
+
+
+def add_json_parser(sub, name):
+    p = sub.add_parser(name)
+    p.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
+    return p
+
+
+def add_doctor_parser(sub, name):
+    p = sub.add_parser(name)
+    p.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
+    p.add_argument("--host", help="SSH host to check")
+    p.add_argument("--remote-path", help="Remote path to check on --host")
+    return p
+
+
+def main():
+    load_translations()
+    parser = argparse.ArgumentParser(prog=PROGRAM_NAME)
+    sub = parser.add_subparsers(dest="command")
+
+    add_open_parser(sub, "open")
+    add_open_parser(sub, "init")
+    add_close_parser(sub, "close")
+    add_json_parser(sub, "status")
+    add_json_parser(sub, "list")
+    add_doctor_parser(sub, "doctor")
+    add_json_parser(sub, "version")
+    add_config_parser(sub, "config")
+    add_logs_parser(sub, "logs")
+    add_remove_parser(sub, "remove")
+
+    for alias in ["start", "go", "up"]:
+        add_open_parser(sub, alias)
+    for alias in ["stop", "halt", "down", "end"]:
+        add_close_parser(sub, alias)
+    for alias in ["state", "info"]:
+        add_json_parser(sub, alias)
+    for alias in ["ls", "projects", "tunnels"]:
+        add_json_parser(sub, alias)
+    for alias in ["check", "diagnose"]:
+        add_doctor_parser(sub, alias)
+    for alias in ["paths"]:
+        add_config_parser(sub, alias)
+    for alias in ["log", "tail"]:
+        add_logs_parser(sub, alias)
+
+    for alias in ["rm", "delete", "unregister"]:
+        add_remove_parser(sub, alias)
+
+    args = parser.parse_args()
+
+    if not args.command:
+        args.command = "open"
+        args.yes = False
+        args.mode = None
+        args.live = False
+        args.background = False
+        args.dry_run = False
+        args.json = False
+
+    args.command = ALIASES.get(args.command, args.command)
+    ensure_language_initialized(args)
+
+    if args.command in ["open", "init"]:
+        open_project(args)
+    elif args.command == "close":
+        close_project(args)
+    elif args.command == "status":
+        status_project(args)
+    elif args.command == "list":
+        list_projects(args)
+    elif args.command == "doctor":
+        doctor(exit_on_missing=False, args=args)
+    elif args.command == "config":
+        with state_lock():
+            config(args)
+    elif args.command == "logs":
+        logs(args)
+    elif args.command == "remove":
+        with state_lock():
+            remove_project(args)
+    elif args.command == "version":
+        version(args)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nCancelled.")
+        sys.exit(130)

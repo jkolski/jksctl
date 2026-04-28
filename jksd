@@ -1,0 +1,558 @@
+#!/usr/bin/env python3
+"""
+Background worker for local <-> remote project sync sessions.
+
+Default invocation names:
+  jksd (preferred)
+  uspd (legacy compatibility)
+"""
+
+import argparse
+import json
+import os
+import select
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+CURRENT_LANGUAGE = "en"
+TRANSLATIONS = {}
+
+PROGRAM_NAME = os.environ.get("JKS_PROGRAM_NAME") or (Path(sys.argv[0] or "jksd").name or "jksd")
+CONTROL_NAME = os.environ.get("JKS_CONTROL_NAME") or ("jksctl" if PROGRAM_NAME.startswith("jks") else "uspctl")
+CONFIG_NAME = os.environ.get("JKS_CONFIG_NAME") or CONTROL_NAME
+APP_DIR = Path.home() / ".config" / CONFIG_NAME
+LEGACY_APP_DIR = Path.home() / ".config" / "uspctl" if CONFIG_NAME == "jksctl" else None
+STATE_FILE = APP_DIR / "state.json"
+WORKTREE_DIRNAME = "worktree"
+LOCALE_DIR = Path(__file__).resolve().parent / "locale"
+
+
+def now():
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def _po_unquote(value):
+    return json.loads(value)
+
+
+def load_po(path):
+    catalog = {}
+    if not path.exists():
+        return catalog
+
+    current_key = None
+    current_value = None
+    active = None
+
+    def flush():
+        if current_key is not None and current_value is not None:
+            catalog[current_key] = current_value
+
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("msgid "):
+            flush()
+            current_key = _po_unquote(line[6:].strip())
+            current_value = None
+            active = "msgid"
+        elif line.startswith("msgstr "):
+            current_value = _po_unquote(line[7:].strip())
+            active = "msgstr"
+        elif line.startswith('"') and active == "msgid":
+            current_key = (current_key or "") + _po_unquote(line)
+        elif line.startswith('"') and active == "msgstr":
+            current_value = (current_value or "") + _po_unquote(line)
+
+    flush()
+    catalog.pop("", None)  # header
+    return catalog
+
+
+def load_translations():
+    global TRANSLATIONS
+    TRANSLATIONS = {}
+    for lang in ("en", "pl"):
+        TRANSLATIONS[lang] = load_po(LOCALE_DIR / f"{lang}.po")
+
+
+def set_language(lang):
+    global CURRENT_LANGUAGE
+    CURRENT_LANGUAGE = lang if lang in TRANSLATIONS else "en"
+
+
+def t(key, **kwargs):
+    text = TRANSLATIONS.get(CURRENT_LANGUAGE, {}).get(key) or TRANSLATIONS.get("en", {}).get(key) or key
+    return text.format(**kwargs)
+
+
+def empty_state():
+    return {"version": 1, "meta": {"language": "en"}, "projects": {}}
+
+
+def migrate_legacy_config_if_needed():
+    if LEGACY_APP_DIR is None or APP_DIR.exists() or not LEGACY_APP_DIR.exists():
+        return
+
+    APP_DIR.parent.mkdir(parents=True, exist_ok=True)
+    LEGACY_APP_DIR.rename(APP_DIR)
+
+
+def load_state():
+    migrate_legacy_config_if_needed()
+    if not STATE_FILE.exists() or STATE_FILE.stat().st_size == 0:
+        return empty_state()
+
+    try:
+        with STATE_FILE.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    except json.JSONDecodeError:
+        backup = STATE_FILE.with_suffix(f".broken.{int(time.time())}.json")
+        STATE_FILE.rename(backup)
+        print(f"[{now()}] Broken state.json moved to: {backup}", flush=True)
+        return empty_state()
+
+
+def save_state(state):
+    migrate_legacy_config_if_needed()
+    APP_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = STATE_FILE.with_suffix(".tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2, ensure_ascii=False)
+    tmp.replace(STATE_FILE)
+
+
+def abs_path(path):
+    return str(Path(path).expanduser().resolve())
+
+
+def run(cmd, cwd=None):
+    print(f"[{now()}] $ {' '.join(cmd)}", flush=True)
+    return subprocess.run(cmd, cwd=cwd)
+
+
+def initialize_language_from_state():
+    state = load_state()
+    lang = state.setdefault("meta", {}).get("language", "en")
+    set_language(lang)
+
+
+def worktree_path_for(path):
+    return str(Path(path) / WORKTREE_DIRNAME)
+
+
+def project_worktree(project):
+    return abs_path(project.get("worktree_path") or worktree_path_for(project["path"]))
+
+
+def update_project(path, **fields):
+    state = load_state()
+    key = abs_path(path)
+    project = state.get("projects", {}).get(key)
+
+    if project:
+        project.update(fields)
+        project["updated_at"] = now()
+        save_state(state)
+
+
+def get_project(path):
+    state = load_state()
+    key = abs_path(path)
+    project = state.get("projects", {}).get(key)
+
+    if not project:
+        print(f"[{now()}] Project does not exist in {STATE_FILE}: {key}", flush=True)
+        sys.exit(1)
+
+    return project
+
+
+def unison_remote(project):
+    return f"ssh://{project['remote_host']}/{project['remote_path']}"
+
+
+def run_unison(project, batch=True):
+    if not shutil.which("unison"):
+        update_project(project["path"], last_error="local unison missing", mode="rsync")
+        return 127
+
+    cmd = [
+        "unison",
+        project_worktree(project),
+        unison_remote(project),
+        "-ignore", "Name .git",
+        "-ignore", "Name .DS_Store",
+        "-ignore", "Name .usp-cache",
+        "-terse",
+    ]
+
+    if batch:
+        cmd += ["-batch", "-auto"]
+
+    result = run(cmd)
+
+    if result.returncode == 0:
+        update_project(project["path"], last_unison_at=now(), last_error=None)
+    else:
+        update_project(project["path"], last_error=f"unison failed with code {result.returncode}")
+
+    return result.returncode
+
+
+def rsync_pull(project):
+    source = f"{project['remote_host']}:{project['remote_path'].rstrip('/')}/"
+    dest = project_worktree(project).rstrip("/") + "/"
+
+    cmd = [
+        "rsync", "-az",
+        "--omit-dir-times",
+        "--exclude", ".git",
+        "--exclude", ".DS_Store",
+        "--exclude", ".usp-cache",
+        source, dest,
+    ]
+
+    result = run(cmd)
+
+    if result.returncode == 0:
+        update_project(project["path"], last_rsync_pull_at=now(), last_error=None)
+    else:
+        update_project(project["path"], last_error=f"rsync pull failed with code {result.returncode}")
+
+    return result.returncode
+
+
+def rsync_push(project, changed_paths=None):
+    source = project_worktree(project).rstrip("/") + "/"
+    dest = f"{project['remote_host']}:{project['remote_path'].rstrip('/')}/"
+
+    cmd = [
+        "rsync", "-az",
+        "--omit-dir-times",
+        "--exclude", ".git",
+        "--exclude", ".DS_Store",
+        "--exclude", ".usp-cache",
+    ]
+
+    if project.get("delete_remote"):
+        cmd.append("--delete")
+
+    cmd += [source, dest]
+
+    started = time.time()
+    result = run(cmd)
+    duration = time.time() - started
+
+    if result.returncode == 0:
+        update_project(project["path"], last_rsync_push_at=now(), last_error=None)
+        log_push_result(changed_paths or [], duration, ok=True)
+    else:
+        update_project(project["path"], last_error=f"rsync push failed with code {result.returncode}")
+        log_push_result(changed_paths or [], duration, ok=False)
+
+    return result.returncode
+
+
+def sync_pull_with_mode(project):
+    mode = project.get("mode", "unison")
+
+    if mode == "rsync":
+        return rsync_pull(project)
+
+    code = run_unison(project, batch=True)
+
+    if code == 0:
+        return 0
+
+    print(f"[{now()}] [{PROGRAM_NAME}] Unison failed -> switching project mode to rsync", flush=True)
+    update_project(project["path"], mode="rsync")
+    project["mode"] = "rsync"
+
+    return rsync_pull(project)
+
+
+def git_commit_env():
+    env = os.environ.copy()
+    env.setdefault("GIT_AUTHOR_NAME", "JKSync")
+    env.setdefault("GIT_AUTHOR_EMAIL", "jksync@localhost")
+    env.setdefault("GIT_COMMITTER_NAME", env["GIT_AUTHOR_NAME"])
+    env.setdefault("GIT_COMMITTER_EMAIL", env["GIT_AUTHOR_EMAIL"])
+    return env
+
+
+def git_commit(path, message):
+    run(["git", "add", "-A"], cwd=path)
+
+    diff = subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=path)
+    if diff.returncode == 0:
+        print(f"[{now()}] Git: brak zmian do commita.", flush=True)
+        return False
+
+    print(f"[{now()}] $ git commit -m {json.dumps(message)}", flush=True)
+    result = subprocess.run(["git", "commit", "-m", message], cwd=path, env=git_commit_env())
+
+    if result.returncode == 0:
+        update_project(path, last_commit_at=now(), last_error=None)
+        return True
+
+    update_project(path, last_error=f"git commit failed with code {result.returncode}")
+    return False
+
+
+def start_fswatch(path):
+    return subprocess.Popen(
+        ["fswatch", "-0", path],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+
+
+def read_fswatch_events(process, max_bytes=65536):
+    if not process.stdout:
+        return []
+
+    chunks = []
+
+    try:
+        os.set_blocking(process.stdout.fileno(), False)
+    except Exception:
+        pass
+
+    total = 0
+
+    while total < max_bytes:
+        try:
+            chunk = process.stdout.read(4096)
+        except BlockingIOError:
+            break
+        except Exception:
+            break
+
+        if not chunk:
+            break
+
+        chunks.append(chunk)
+        total += len(chunk)
+
+        if len(chunk) < 4096:
+            break
+
+    if not chunks:
+        return []
+
+    payload = b"".join(chunks)
+    raw_paths = [part.decode("utf-8", errors="replace") for part in payload.split(b"\0") if part]
+    return raw_paths
+
+
+def wait_for_fswatch_events(process, timeout=0.0):
+    if not process.stdout:
+        return []
+
+    wait_timeout = max(0.0, timeout)
+
+    try:
+        ready, _, _ = select.select([process.stdout], [], [], wait_timeout)
+    except InterruptedError:
+        return []
+    except Exception:
+        ready = [process.stdout]
+
+    if not ready:
+        return []
+
+    return read_fswatch_events(process)
+
+
+def relative_changed_paths(worktree, raw_paths):
+    base = Path(worktree).resolve()
+    seen = []
+
+    for raw_path in raw_paths:
+        resolved = Path(raw_path).expanduser().resolve()
+        try:
+            rel = resolved.relative_to(base)
+            rel_text = rel.as_posix() or "."
+        except Exception:
+            rel_text = os.path.relpath(str(resolved), str(base))
+
+        if rel_text in [".git", ".usp-cache"] or rel_text.startswith(".git/") or rel_text.startswith(".usp-cache/"):
+            continue
+
+        if rel_text not in seen:
+            seen.append(rel_text)
+
+    return seen
+
+
+def log_push_result(changed_paths, duration_seconds, ok=True):
+    if not changed_paths:
+        changed_paths = ["(detected changes)"]
+
+    status = "push ok" if ok else "push failed"
+    print(f"[{now()}] {status} | duration={duration_seconds:.3f}s", flush=True)
+    for rel_path in changed_paths:
+        print(f"[{now()}]   {rel_path}", flush=True)
+
+
+def daemon_loop(project):
+    path = project["path"]
+    worktree = project_worktree(project)
+    stop_requested = False
+
+    def shutdown(signum, frame):
+        nonlocal stop_requested
+        print(f"[{now()}] Otrzymano sygnał {signum}. Kończę graceful shutdown.", flush=True)
+        stop_requested = True
+
+    signal.signal(signal.SIGTERM, shutdown)
+    signal.signal(signal.SIGINT, shutdown)
+
+    update_project(
+        path,
+        active=True,
+        pid=os.getpid(),
+        started_at=now(),
+        stopped_at=None,
+        last_error=None,
+    )
+
+    pid_file = project.get("pid_file")
+    if pid_file:
+        Path(pid_file).parent.mkdir(parents=True, exist_ok=True)
+        Path(pid_file).write_text(str(os.getpid()), encoding="utf-8")
+
+    print(f"[{now()}] {PROGRAM_NAME} start for {project['name']}", flush=True)
+    print(f"[{now()}] mode={project.get('mode', 'unison')}", flush=True)
+    print(f"[{now()}] path={project['path']}", flush=True)
+    print(f"[{now()}] worktree={worktree}", flush=True)
+    print(f"[{now()}] remote={project['remote_host']}:{project['remote_path']}", flush=True)
+
+    Path(worktree).mkdir(parents=True, exist_ok=True)
+    fswatch = start_fswatch(worktree)
+
+    # `jksctl open` already performs the initial sync before starting the daemon.
+    # Do not immediately pull again here, because a fast local edit right after
+    # open could otherwise be overwritten by a redundant remote pull.
+    last_pull = time.time()
+    pending_push = False
+    pending_since = None
+    pending_paths = []
+
+    try:
+        while not stop_requested:
+            project = get_project(path)
+
+            now_ts = time.time()
+            pull_interval = max(1.0, float(project.get("pull_interval", 60)))
+            debounce = max(0.0, float(project.get("debounce", 0.3)))
+
+            if now_ts - last_pull >= pull_interval:
+                sync_pull_with_mode(project)
+                last_pull = time.time()
+
+            now_ts = time.time()
+
+            if fswatch.poll() is not None:
+                print(f"[{now()}] fswatch zakończył pracę. Restartuję.", flush=True)
+                fswatch = start_fswatch(worktree)
+
+            wait_timeout = min(0.1, max(0.0, pull_interval - (now_ts - last_pull)))
+
+            if pending_push and pending_since is not None:
+                wait_timeout = min(wait_timeout, max(0.0, (pending_since + debounce) - now_ts))
+
+            raw_paths = wait_for_fswatch_events(fswatch, timeout=wait_timeout)
+            if raw_paths:
+                pending_push = True
+                for rel_path in relative_changed_paths(worktree, raw_paths):
+                    if rel_path not in pending_paths:
+                        pending_paths.append(rel_path)
+                if pending_since is None:
+                    pending_since = time.time()
+
+            now_ts = time.time()
+
+            if pending_push and pending_since is not None and now_ts >= pending_since + debounce:
+                project = get_project(path)
+                changed_paths = list(pending_paths)
+                rsync_push(project, changed_paths=changed_paths)
+                pending_push = False
+                pending_since = None
+                pending_paths = []
+
+    finally:
+        print(f"[{now()}] Graceful shutdown start.", flush=True)
+        print(f"[{now()}] Shutdown: stopping fswatch...", flush=True)
+
+        try:
+            fswatch.terminate()
+            fswatch.wait(timeout=5)
+            print(f"[{now()}] Shutdown: fswatch stopped.", flush=True)
+        except Exception:
+            print(f"[{now()}] Shutdown: fswatch did not exit cleanly, trying kill.", flush=True)
+            try:
+                fswatch.kill()
+            except Exception:
+                pass
+
+        project = get_project(path)
+
+        if project.get("mode", "unison") == "rsync":
+            print(f"[{now()}] Shutdown: final push start.", flush=True)
+            rsync_push(project)
+            print(f"[{now()}] Shutdown: final push done.", flush=True)
+
+            print(f"[{now()}] Shutdown: final pull/sync skipped for rsync mode after final push.", flush=True)
+        else:
+            print(f"[{now()}] Shutdown: final pull/sync start.", flush=True)
+            sync_pull_with_mode(project)
+            print(f"[{now()}] Shutdown: final pull/sync done.", flush=True)
+
+            print(f"[{now()}] Shutdown: final push start.", flush=True)
+            rsync_push(project)
+            print(f"[{now()}] Shutdown: final push done.", flush=True)
+
+        print(f"[{now()}] Shutdown: git commit start.", flush=True)
+        git_commit(path, f"{CONTROL_NAME} close {now()}")
+        print(f"[{now()}] Shutdown: git commit done.", flush=True)
+
+        pid_file = project.get("pid_file")
+        if pid_file:
+            try:
+                Path(pid_file).unlink(missing_ok=True)
+                print(f"[{now()}] Shutdown: removed pid file {pid_file}.", flush=True)
+            except Exception:
+                pass
+
+        update_project(
+            path,
+            active=False,
+            pid=None,
+            stopped_at=now(),
+        )
+
+        print(f"[{now()}] {PROGRAM_NAME} stop.", flush=True)
+
+
+def main():
+    load_translations()
+    initialize_language_from_state()
+    parser = argparse.ArgumentParser(prog=PROGRAM_NAME)
+    parser.add_argument("--project", required=True, help="Absolute project path")
+    args = parser.parse_args()
+
+    path = abs_path(args.project)
+    project = get_project(path)
+    daemon_loop(project)
+
+
+if __name__ == "__main__":
+    main()
