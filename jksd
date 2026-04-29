@@ -32,6 +32,15 @@ WORKTREE_DIRNAME = "worktree"
 LOCALE_DIR = Path(__file__).resolve().parent / "locale"
 
 
+def shutdown_sync_timeout():
+    raw = os.environ.get("JKS_SHUTDOWN_SYNC_TIMEOUT", "10")
+
+    try:
+        return max(1.0, float(raw))
+    except (TypeError, ValueError):
+        return 10.0
+
+
 def now():
     return datetime.now().isoformat(timespec="seconds")
 
@@ -132,9 +141,38 @@ def abs_path(path):
     return str(Path(path).expanduser().resolve())
 
 
-def run(cmd, cwd=None):
+def run(cmd, cwd=None, timeout=None):
     print(f"[{now()}] $ {' '.join(cmd)}", flush=True)
-    return subprocess.run(cmd, cwd=cwd)
+
+    process = subprocess.Popen(cmd, cwd=cwd, start_new_session=True)
+
+    try:
+        returncode = process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        print(f"[{now()}] command timed out after {timeout:.1f}s; terminating process group", flush=True)
+
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        except Exception as exc:
+            print(f"[{now()}] failed to terminate process group: {exc}", flush=True)
+
+        try:
+            process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            print(f"[{now()}] process group still running; killing", flush=True)
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except Exception as exc:
+                print(f"[{now()}] failed to kill process group: {exc}", flush=True)
+            process.wait()
+
+        returncode = 124
+
+    return subprocess.CompletedProcess(cmd, returncode)
 
 
 def initialize_language_from_state():
@@ -178,7 +216,7 @@ def unison_remote(project):
     return f"ssh://{project['remote_host']}/{project['remote_path']}"
 
 
-def run_unison(project, batch=True):
+def run_unison(project, batch=True, timeout=None):
     if not shutil.which("unison"):
         update_project(project["path"], last_error="local unison missing", mode="rsync")
         return 127
@@ -196,7 +234,7 @@ def run_unison(project, batch=True):
     if batch:
         cmd += ["-batch", "-auto"]
 
-    result = run(cmd)
+    result = run(cmd, timeout=timeout)
 
     if result.returncode == 0:
         update_project(project["path"], last_unison_at=now(), last_error=None)
@@ -206,7 +244,7 @@ def run_unison(project, batch=True):
     return result.returncode
 
 
-def rsync_pull(project):
+def rsync_pull(project, timeout=None):
     source = f"{project['remote_host']}:{project['remote_path'].rstrip('/')}/"
     dest = project_worktree(project).rstrip("/") + "/"
 
@@ -219,7 +257,7 @@ def rsync_pull(project):
         source, dest,
     ]
 
-    result = run(cmd)
+    result = run(cmd, timeout=timeout)
 
     if result.returncode == 0:
         update_project(project["path"], last_rsync_pull_at=now(), last_error=None)
@@ -229,7 +267,7 @@ def rsync_pull(project):
     return result.returncode
 
 
-def rsync_push(project, changed_paths=None):
+def rsync_push(project, changed_paths=None, timeout=None):
     source = project_worktree(project).rstrip("/") + "/"
     dest = f"{project['remote_host']}:{project['remote_path'].rstrip('/')}/"
 
@@ -247,7 +285,7 @@ def rsync_push(project, changed_paths=None):
     cmd += [source, dest]
 
     started = time.time()
-    result = run(cmd)
+    result = run(cmd, timeout=timeout)
     duration = time.time() - started
 
     if result.returncode == 0:
@@ -260,13 +298,13 @@ def rsync_push(project, changed_paths=None):
     return result.returncode
 
 
-def sync_pull_with_mode(project):
+def sync_pull_with_mode(project, timeout=None):
     mode = project.get("mode", "unison")
 
     if mode == "rsync":
-        return rsync_pull(project)
+        return rsync_pull(project, timeout=timeout)
 
-    code = run_unison(project, batch=True)
+    code = run_unison(project, batch=True, timeout=timeout)
 
     if code == 0:
         return 0
@@ -275,7 +313,7 @@ def sync_pull_with_mode(project):
     update_project(project["path"], mode="rsync")
     project["mode"] = "rsync"
 
-    return rsync_pull(project)
+    return rsync_pull(project, timeout=timeout)
 
 
 def git_commit_env():
@@ -504,21 +542,32 @@ def daemon_loop(project):
                 pass
 
         project = get_project(path)
+        final_sync_timeout = shutdown_sync_timeout()
+        print(f"[{now()}] Shutdown: final sync timeout={final_sync_timeout:.1f}s.", flush=True)
 
         if project.get("mode", "unison") == "rsync":
             print(f"[{now()}] Shutdown: final push start.", flush=True)
-            rsync_push(project)
-            print(f"[{now()}] Shutdown: final push done.", flush=True)
+            push_code = rsync_push(project, timeout=final_sync_timeout)
+            if push_code == 0:
+                print(f"[{now()}] Shutdown: final push done.", flush=True)
+            else:
+                print(f"[{now()}] Shutdown: final push failed or timed out with code {push_code}; continuing shutdown.", flush=True)
 
             print(f"[{now()}] Shutdown: final pull/sync skipped for rsync mode after final push.", flush=True)
         else:
             print(f"[{now()}] Shutdown: final pull/sync start.", flush=True)
-            sync_pull_with_mode(project)
-            print(f"[{now()}] Shutdown: final pull/sync done.", flush=True)
+            pull_code = sync_pull_with_mode(project, timeout=final_sync_timeout)
+            if pull_code == 0:
+                print(f"[{now()}] Shutdown: final pull/sync done.", flush=True)
+            else:
+                print(f"[{now()}] Shutdown: final pull/sync failed or timed out with code {pull_code}; continuing shutdown.", flush=True)
 
             print(f"[{now()}] Shutdown: final push start.", flush=True)
-            rsync_push(project)
-            print(f"[{now()}] Shutdown: final push done.", flush=True)
+            push_code = rsync_push(project, timeout=final_sync_timeout)
+            if push_code == 0:
+                print(f"[{now()}] Shutdown: final push done.", flush=True)
+            else:
+                print(f"[{now()}] Shutdown: final push failed or timed out with code {push_code}; continuing shutdown.", flush=True)
 
         print(f"[{now()}] Shutdown: git commit start.", flush=True)
         git_commit(path, f"{CONTROL_NAME} close {now()}")

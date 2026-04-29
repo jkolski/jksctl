@@ -160,6 +160,7 @@ Agents should assume:
 - `--background` returns control to the caller
 - `--live` is for humans or explicit debugging sessions
 - the daemon handles sync automatically after startup
+- shutdown final sync is bounded by `JKS_SHUTDOWN_SYNC_TIMEOUT` (default 10 seconds), so SSH/auth helper flows cannot block exit forever
 
 Agents should close sessions explicitly when a task is done and a long-running daemon is not desired:
 

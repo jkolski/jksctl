@@ -159,6 +159,7 @@ The daemon:
 - periodically pulls/syncs remote updates
 - logs changed relative paths, timestamps, and push durations
 - performs graceful shutdown with final sync and commit steps
+- bounds final shutdown sync commands so an SSH/auth flow cannot block daemon exit forever
 
 Background mode:
 
@@ -173,6 +174,12 @@ jksctl open --live
 ```
 
 In live mode, `Ctrl+C` sends a graceful shutdown signal to the daemon.
+
+During shutdown, final sync commands use a timeout so external SSH/auth helpers cannot block daemon exit indefinitely. The default timeout is 10 seconds and can be overridden for the daemon with:
+
+```bash
+JKS_SHUTDOWN_SYNC_TIMEOUT=30 jksd --project /path/to/project
+```
 
 ## Commands
 
