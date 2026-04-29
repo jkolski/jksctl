@@ -228,6 +228,9 @@ Stop:
 
 ```bash
 jksctl close
+jksctl close --path /absolute/or/relative/session-root
+jksctl close --name my-project
+jksctl close --name=my-project
 jksctl stop
 jksctl halt
 jksctl down

@@ -165,8 +165,11 @@ Agents should assume:
 Agents should close sessions explicitly when a task is done and a long-running daemon is not desired:
 
 ```bash
-jksctl close
+jksctl close --path /absolute/or/relative/session-root
+jksctl close --name=my-project
 ```
+
+`--name value` and `--name=value` are both supported by the CLI parser.
 
 ## Logging
 

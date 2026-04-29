@@ -1041,7 +1041,7 @@ def open_project(args):
                 return
 
             if action == "disable":
-                close_args = argparse.Namespace(wait=True, timeout=30)
+                close_args = argparse.Namespace(wait=True, timeout=30, path=path, name=None)
                 close_project(close_args)
                 return
 
@@ -1142,16 +1142,28 @@ def open_project(args):
 
 def close_project(args):
     state = reconcile_state(load_state())
-    path = current_project_key(state=state)
+    path = resolve_project_key(
+        state,
+        path=getattr(args, "path", None),
+        name=getattr(args, "name", None),
+    )
     project = state.get("projects", {}).get(path)
 
     if not project:
-        print(t('project.not_registered_here'))
+        if getattr(args, "path", None):
+            print(f"Projekt o path {abs_path(args.path)} nie jest zarejestrowany.")
+        elif getattr(args, "name", None):
+            print(f"Projekt o nazwie {args.name} nie jest zarejestrowany.")
+        else:
+            print(t('project.not_registered_here'))
         return
 
     pid = project.get("pid")
     if not project.get("active") or not pid_alive(pid):
-        print(t('project.not_active_here'))
+        if getattr(args, "path", None) or getattr(args, "name", None):
+            print(f"Projekt {project['name']} nie jest aktywny.")
+        else:
+            print(t('project.not_active_here'))
         project["active"] = False
         project["pid"] = None
         save_state(state)
@@ -1198,7 +1210,7 @@ def remove_project(args):
     pid = project.get("pid")
     if project.get("active") and pid_alive(pid):
         if getattr(args, "force", False) or prompt_bool(f"Projekt {project['name']} ma aktywny tunel PID {pid}. Zamknąć?", True):
-            close_args = argparse.Namespace(wait=True, timeout=getattr(args, "timeout", 30))
+            close_args = argparse.Namespace(wait=True, timeout=getattr(args, "timeout", 30), path=path, name=None)
             close_project(close_args)
             state = reconcile_state(load_state())
             projects = state.setdefault("projects", {})
@@ -1384,6 +1396,8 @@ def add_open_parser(sub, name):
 
 def add_close_parser(sub, name):
     p = sub.add_parser(name)
+    p.add_argument("--path", help="Zamknij projekt wskazany absolutną lub względną ścieżką session root")
+    p.add_argument("--name", help="Zamknij projekt po nazwie; jeśli nazwa nie jest unikalna, użyj --path")
     p.add_argument("--no-wait", dest="wait", action="store_false", default=True)
     p.add_argument("--timeout", type=int, default=30)
     return p
