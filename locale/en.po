@@ -144,3 +144,9 @@ msgstr "Initial synchronization."
 
 msgid "yes"
 msgstr "yes"
+
+msgid "sync.fetching_remote_stats"
+msgstr "Fetching stats from remote server {host}..."
+
+msgid "sync.progress_format"
+msgstr "Downloaded: {local_files:,} / {remote_files:,} files ({files_pct:.1f}%) | {local_size_str} / {remote_size_str} ({size_pct:.1f}%)"

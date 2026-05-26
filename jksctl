@@ -716,7 +716,129 @@ def unison_remote(project):
     return f"ssh://{project['remote_host']}/{project['remote_path']}"
 
 
-def run_unison(project, batch=False):
+def format_size(bytes_val):
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+        if bytes_val < 1024.0:
+            return f"{bytes_val:.2f} {unit}"
+        bytes_val /= 1024.0
+    return f"{bytes_val:.2f} PB"
+
+
+def count_local_files_and_bytes(worktree_path):
+    local_files = 0
+    local_bytes = 0
+    wt = Path(worktree_path)
+    if not wt.exists():
+        return 0, 0
+    ex = {'.git', '.DS_Store', '.usp-cache'}
+    for r, dirs, files in os.walk(wt):
+        dirs[:] = [d for d in dirs if d not in ex]
+        for f in files:
+            if f in ex or f.startswith('.'):
+                continue
+            fp = os.path.join(r, f)
+            if not os.path.islink(fp):
+                try:
+                    local_bytes += os.path.getsize(fp)
+                    local_files += 1
+                except OSError:
+                    pass
+    return local_files, local_bytes
+
+
+def get_remote_stats(host, remote_path):
+    print(t("sync.fetching_remote_stats", host=host))
+    py_code = (
+        "import os, sys\n"
+        "p = sys.argv[1]\n"
+        "tf, tb = 0, 0\n"
+        "ex = {'.git', '.DS_Store', '.usp-cache'}\n"
+        "for r, dirs, files in os.walk(p):\n"
+        "    dirs[:] = [d for d in dirs if d not in ex]\n"
+        "    for f in files:\n"
+        "        if f in ex: continue\n"
+        "        fp = os.path.join(r, f)\n"
+        "        if not os.path.islink(fp):\n"
+        "            try:\n"
+        "                tb += os.path.getsize(fp)\n"
+        "                tf += 1\n"
+        "            except OSError: pass\n"
+        "print(f'{tf} {tb}')\n"
+    )
+    cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", host, "python3", "-", remote_path]
+    try:
+        res = subprocess.run(cmd, input=py_code, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=12)
+        if res.returncode == 0:
+            parts = res.stdout.strip().split()
+            if len(parts) == 2:
+                return int(parts[0]), int(parts[1])
+    except Exception:
+        pass
+    return None
+
+
+def run_with_progress(cmd, project, remote_files, remote_bytes):
+    print("$ " + " ".join(cmd))
+    log_dir = Path(project["log_file"]).parent
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / "initial_sync.log"
+    
+    worktree = project_worktree(project)
+    
+    with open(log_path, "w", encoding="utf-8") as log_f:
+        proc = subprocess.Popen(cmd, stdout=log_f, stderr=log_f)
+        
+        sys.stdout.write("\r" + t(
+            "sync.progress_format",
+            local_files=0,
+            remote_files=remote_files,
+            files_pct=0.0,
+            local_size_str=format_size(0),
+            remote_size_str=format_size(remote_bytes),
+            size_pct=0.0
+        ))
+        sys.stdout.flush()
+        
+        while proc.poll() is None:
+            time.sleep(0.5)
+            local_files, local_bytes = count_local_files_and_bytes(worktree)
+            
+            files_pct = (local_files / remote_files * 100.0) if remote_files > 0 else 0.0
+            size_pct = (local_bytes / remote_bytes * 100.0) if remote_bytes > 0 else 0.0
+            
+            prog_text = t(
+                "sync.progress_format",
+                local_files=local_files,
+                remote_files=remote_files,
+                files_pct=files_pct,
+                local_size_str=format_size(local_bytes),
+                remote_size_str=format_size(remote_bytes),
+                size_pct=size_pct
+            )
+            sys.stdout.write(f"\r{prog_text}")
+            sys.stdout.flush()
+            
+        proc.wait()
+        
+    local_files, local_bytes = count_local_files_and_bytes(worktree)
+    files_pct = (local_files / remote_files * 100.0) if remote_files > 0 else 100.0
+    size_pct = (local_bytes / remote_bytes * 100.0) if remote_bytes > 0 else 100.0
+    prog_text = t(
+        "sync.progress_format",
+        local_files=local_files,
+        remote_files=remote_files,
+        files_pct=files_pct,
+        local_size_str=format_size(local_bytes),
+        remote_size_str=format_size(remote_bytes),
+        size_pct=size_pct
+    )
+    sys.stdout.write(f"\r{prog_text}\n")
+    sys.stdout.flush()
+    
+    return proc
+
+
+def run_unison(project, batch=False, remote_stats=None):
     cmd = [
         "unison",
         project_worktree(project),
@@ -728,10 +850,12 @@ def run_unison(project, batch=False):
     ]
     if batch:
         cmd += ["-batch", "-auto"]
+    if remote_stats:
+        return run_with_progress(cmd, project, remote_stats[0], remote_stats[1])
     return run(cmd)
 
 
-def rsync_pull(project):
+def rsync_pull(project, remote_stats=None):
     source = f"{project['remote_host']}:{project['remote_path'].rstrip('/')}/"
     dest = project_worktree(project).rstrip("/") + "/"
     cmd = [
@@ -742,45 +866,33 @@ def rsync_pull(project):
         "--exclude", ".usp-cache",
         source, dest,
     ]
-    return run(cmd)
-
-
-def rsync_push(project):
-    source = project_worktree(project).rstrip("/") + "/"
-    dest = f"{project['remote_host']}:{project['remote_path'].rstrip('/')}/"
-    cmd = [
-        "rsync", "-az",
-        "--omit-dir-times",
-        "--exclude", ".git",
-        "--exclude", ".DS_Store",
-        "--exclude", ".usp-cache",
-    ]
-    if project.get("delete_remote"):
-        cmd.append("--delete")
-    cmd += [source, dest]
+    if remote_stats:
+        return run_with_progress(cmd, project, remote_stats[0], remote_stats[1])
     return run(cmd)
 
 
 def initial_sync_with_fallback(project):
     mode = project.get("mode", "unison")
+    
+    remote_stats = get_remote_stats(project["remote_host"], project["remote_path"])
 
     if mode == "rsync":
         print(f"\n[{PROGRAM_NAME}] Startowy sync: rsync pull")
-        result = rsync_pull(project)
+        result = rsync_pull(project, remote_stats=remote_stats)
         return result.returncode, "rsync"
 
     if not shutil.which("unison"):
         print(f"\n[{PROGRAM_NAME}] Unison nie jest lokalnie dostępny → fallback do rsync pull")
-        result = rsync_pull(project)
+        result = rsync_pull(project, remote_stats=remote_stats)
         return result.returncode, "rsync"
 
     print(f"\n[{PROGRAM_NAME}] Startowy sync: Unison")
-    result = run_unison(project, batch=False)
+    result = run_unison(project, batch=False, remote_stats=remote_stats)
     if result.returncode == 0:
         return 0, "unison"
 
     print(f"\n[{PROGRAM_NAME}] Unison failed → fallback do rsync pull\n")
-    result = rsync_pull(project)
+    result = rsync_pull(project, remote_stats=remote_stats)
     return result.returncode, "rsync"
 
 

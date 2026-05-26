@@ -144,3 +144,9 @@ msgstr "Synchronizacja startowa."
 
 msgid "yes"
 msgstr "tak"
+
+msgid "sync.fetching_remote_stats"
+msgstr "Pobieranie statystyk ze zdalnego serwera {host}..."
+
+msgid "sync.progress_format"
+msgstr "Pobrano: {local_files:,} / {remote_files:,} plików ({files_pct:.1f}%) | {local_size_str} / {remote_size_str} ({size_pct:.1f}%)"
